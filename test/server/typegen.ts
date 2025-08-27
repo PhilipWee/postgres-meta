@@ -3148,3 +3148,18 @@ test('typegen: swift w/ public access control', async () => {
     }"
   `)
 })
+
+test('typegen: zod', async () => {
+  const { body } = await app.inject({ method: 'GET', path: '/generators/zod' })
+  expect(body).toContain("import { z } from 'zod'")
+  expect(body).toContain('JsonSchema')
+  expect(body).toContain('PublicUsersRowSchema')
+  expect(body).toContain('PublicTodosRowSchema')
+  expect(body).toContain('PublicUserStatusSchema')
+  expect(body).toContain('PublicMemeStatusSchema')
+  expect(body).toContain('validateTableInsert')
+  expect(body).toContain('validateTableUpdate')
+  expect(body).toContain('validateFunctionArgs')
+  expect(body).toContain('.nullable()')
+  expect(body).toContain('.optional()')
+})

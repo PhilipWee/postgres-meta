@@ -597,6 +597,7 @@ const pgTypeToTsType = (
     views: PostgresView[]
   }
 ): string => {
+  console.log(pgType)
   if (pgType === 'bool') {
     return 'boolean'
   } else if (['int2', 'int4', 'int8', 'float4', 'float8', 'numeric'].includes(pgType)) {
