@@ -10,6 +10,8 @@ import type {
 import type { GeneratorMetadata } from '../../lib/generators.js'
 import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 
+type ZodGenMode = 'list' | 'insert' | 'update'
+
 export const apply = async ({
   schemas,
   tables,
@@ -45,16 +47,13 @@ export const apply = async ({
   const withNullable = (inner: string, isNullable: boolean) =>
     isNullable ? `${inner}.nullable()` : inner
 
-  const makeListShapeLine = (col: PostgresColumn, ctx: Parameters<typeof pgTypeToZodSchema>[2]) => {
-    const base = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+  const makeListShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
+    const base = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'list')
     const z = withNullable(base, col.is_nullable)
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
-  const makeInsertShapeLine = (
-    col: PostgresColumn,
-    ctx: Parameters<typeof pgTypeToZodSchema>[2]
-  ) => {
+  const makeInsertShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
     // Optional when: nullable OR identity OR has default
     const isOptional = col.is_nullable || col.is_identity || col.default_value !== null
 
@@ -63,22 +62,19 @@ export const apply = async ({
       return `${JSON.stringify(col.name)}?: z.never()`
     }
 
-    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'insert')
     z = withNullable(z, col.is_nullable)
     if (isOptional) z += '.optional()'
 
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
-  const makeUpdateShapeLine = (
-    col: PostgresColumn,
-    ctx: Parameters<typeof pgTypeToZodSchema>[2]
-  ) => {
+  const makeUpdateShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
     // Update: everything optional; identity ALWAYS -> forbid value if provided
     if (col.identity_generation === 'ALWAYS') {
       return `${JSON.stringify(col.name)}?: z.never()`
     }
-    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'update')
     z = withNullable(z, col.is_nullable)
     z += '.optional()'
     return `${JSON.stringify(col.name)}: ${z}`
@@ -86,13 +82,13 @@ export const apply = async ({
 
   // Build the file as a string
   let out = `
-// Auto-generated Zod schemas for Supabase table types
+/* START GENERATED TYPES */
 import { z } from "zod";
 
 export const supabaseZodSchemas = {
   ${defaultSchemaTables
     .map((table) => {
-      const ctx = { types, schemas, tables, views }
+      const ctx: PgTypeCtx = { types, schemas, tables, views }
       const cols = columnsByTableId[table.id] ?? []
 
       const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
@@ -120,6 +116,13 @@ export const supabaseZodSchemas = {
   return out
 }
 
+type PgTypeCtx = {
+  types: PostgresType[]
+  schemas: PostgresSchema[]
+  tables: PostgresTable[]
+  views: PostgresView[]
+}
+
 const pgTypeToZodSchema = (
   schema: PostgresSchema,
   pgType: string,
@@ -127,29 +130,25 @@ const pgTypeToZodSchema = (
     types,
     schemas,
     tables, // kept for signature compatibility
-    views, // kept for signature compatibility
-  }: {
-    types: PostgresType[]
-    schemas: PostgresSchema[]
-    tables: PostgresTable[]
-    views: PostgresView[]
-  }
+    views,  // kept for signature compatibility
+  }: PgTypeCtx,
+  mode: ZodGenMode // <-- new
 ): string => {
   const numberTypes = new Set(['int2', 'int4', 'int8', 'float4', 'float8', 'numeric'])
+
+  // Treat time-only as strings; date/timestamp handled below
   const stringTypes = new Set([
     'bytea',
     'bpchar',
     'varchar',
-    'date',
     'text',
     'citext',
     'time',
     'timetz',
-    'timestamp',
-    'timestamptz',
-    'uuid',
     'vector',
   ])
+
+  const dateLikeTypes = new Set(['date', 'timestamp', 'timestamptz'])
 
   const getEnumVariants = (t: string): string[] | null => {
     const enumTypes = types.filter((type) => type.name === t && type.enums.length > 0)
@@ -166,7 +165,7 @@ const pgTypeToZodSchema = (
       schemas,
       tables,
       views,
-    })})`
+    }, mode)})`
   }
 
   // Enums inline
@@ -178,6 +177,21 @@ const pgTypeToZodSchema = (
   // Scalars
   if (pgType === 'bool') return 'z.boolean()'
   if (numberTypes.has(pgType)) return 'z.number()'
+
+  // Date-like handling differs by mode:
+  if (dateLikeTypes.has(pgType)) {
+    if (mode === 'list') {
+      // Read shapes coerce to Date
+      return 'z.coerce.date()'
+    } else {
+      // Write shapes: only Date in, string out (ISO)
+      return 'z.instanceof(Date).transform(d => d.toISOString())'
+    }
+  }
+
+  // UUID with format validation
+  if (pgType === 'uuid') return 'z.string().uuid()' // (avoid z.uuid(); ensure zod compatibility)
+
   if (stringTypes.has(pgType)) return 'z.string()'
   if (pgType === 'json' || pgType === 'jsonb') return 'z.any()'
   if (pgType === 'void') return 'z.undefined()'
