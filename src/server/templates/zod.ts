@@ -8,6 +8,7 @@ import type {
   PostgresView,
 } from '../../lib/index.js'
 import type { GeneratorMetadata } from '../../lib/generators.js'
+import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 
 export const apply = async ({
   schemas,
@@ -16,10 +17,9 @@ export const apply = async ({
   views,
   materializedViews,
   columns,
-  relationships,
-  functions,
   types,
 }: GeneratorMetadata): Promise<string> => {
+  // Index columns by relation id
   const columnsByTableId = Object.fromEntries<PostgresColumn[]>(
     [...tables, ...foreignTables, ...views, ...materializedViews].map((t) => [t.id, []])
   )
@@ -28,369 +28,106 @@ export const apply = async ({
     .sort(({ name: a }, { name: b }) => a.localeCompare(b))
     .forEach((c) => columnsByTableId[c.table_id].push(c))
 
-  let output = `
-import { z } from 'zod'
+  // Only emit for the default schema (matches your example)
+  const defaultSchemaName = GENERATE_TYPES_DEFAULT_SCHEMA as string
+  const defaultSchema =
+    schemas.find((s) => s.name === defaultSchemaName) ??
+    schemas[0] ??
+    ({
+      name: defaultSchemaName,
+    } as PostgresSchema)
 
-// JSON type for complex fields
-export const JsonSchema = z.union([
-  z.string(),
-  z.number(),
-  z.boolean(),
-  z.null(),
-  z.lazy(() => z.record(JsonSchema)),
-  z.lazy(() => z.array(JsonSchema)),
-])
+  const defaultSchemaTables = [...tables, ...foreignTables]
+    .filter((t) => t.schema === defaultSchema.name)
+    .sort(({ name: a }, { name: b }) => a.localeCompare(b))
 
-export type Json = z.infer<typeof JsonSchema>
+  // Helpers to wrap nullable / optional
+  const withNullable = (inner: string, isNullable: boolean) =>
+    isNullable ? `${inner}.nullable()` : inner
 
-// Enum schemas
-${schemas
-  .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-  .map((schema) => {
-    const schemaEnums = types
-      .filter((type) => type.schema === schema.name && type.enums.length > 0)
-      .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-    
-    if (schemaEnums.length === 0) return ''
-    
-    return `// ${schema.name} schema enums
-${schemaEnums.map(
-  (enum_) =>
-    `export const ${toPascalCase(schema.name)}${toPascalCase(enum_.name)}Schema = z.enum([${enum_.enums
-      .map((variant) => JSON.stringify(variant))
-      .join(', ')}])
-export type ${toPascalCase(schema.name)}${toPascalCase(enum_.name)} = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(enum_.name)}Schema>`
-).join('\n\n')}`
-  })
-  .filter(Boolean)
-  .join('\n\n')}
-
-// Composite type schemas
-${schemas
-  .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-  .map((schema) => {
-    const schemaCompositeTypes = types
-      .filter((type) => type.schema === schema.name && type.attributes.length > 0)
-      .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-    
-    if (schemaCompositeTypes.length === 0) return ''
-    
-    return `// ${schema.name} schema composite types
-${schemaCompositeTypes.map(
-  ({ name, attributes }) =>
-    `export const ${toPascalCase(schema.name)}${toPascalCase(name)}Schema = z.object({
-  ${attributes.map(({ name, type_id }) => {
-    const type = types.find(({ id }) => id === type_id)
-    let zodType = 'z.unknown()'
-    if (type) {
-      zodType = pgTypeToZodType(schema, type.name, { types, schemas, tables, views })
-    }
-    return `${JSON.stringify(name)}: ${zodType}.nullable()`
-  }).join(',\n  ')}
-})
-export type ${toPascalCase(schema.name)}${toPascalCase(name)} = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(name)}Schema>`
-).join('\n\n')}`
-  })
-  .filter(Boolean)
-  .join('\n\n')}
-
-// Table schemas
-${schemas
-  .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-  .map((schema) => {
-    const schemaTables = [...tables, ...foreignTables]
-      .filter((table) => table.schema === schema.name)
-      .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-    
-    if (schemaTables.length === 0) return ''
-    
-    return `// ${schema.name} schema tables
-${schemaTables.map((table) => {
-  const tableColumns = columnsByTableId[table.id]
-  
-  // Row schema (all fields)
-  const rowSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(table.name)}RowSchema = z.object({
-  ${tableColumns.map((column) => {
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    const nullable = column.is_nullable ? '.nullable()' : ''
-    return `${JSON.stringify(column.name)}: ${zodType}${nullable}`
-  }).join(',\n  ')}
-})`
-
-  // Insert schema (optional/required fields based on defaults, identity, etc.)
-  const insertSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(table.name)}InsertSchema = z.object({
-  ${tableColumns.map((column) => {
-    if (column.identity_generation === 'ALWAYS') {
-      return `${JSON.stringify(column.name)}: z.never().optional()`
-    }
-    
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    const nullable = column.is_nullable ? '.nullable()' : ''
-    const optional = column.is_nullable || column.is_identity || column.default_value !== null ? '.optional()' : ''
-    
-    return `${JSON.stringify(column.name)}: ${zodType}${nullable}${optional}`
-  }).join(',\n  ')}
-})`
-
-  // Update schema (all fields optional)
-  const updateSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(table.name)}UpdateSchema = z.object({
-  ${tableColumns.map((column) => {
-    if (column.identity_generation === 'ALWAYS') {
-      return `${JSON.stringify(column.name)}: z.never().optional()`
-    }
-    
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    const nullable = column.is_nullable ? '.nullable()' : ''
-    
-          return `${JSON.stringify(column.name)}: ${zodType}${nullable}.optional()`
-  }).join(',\n  ')}
-})`
-
-  // Types
-  const typeExports = `export type ${toPascalCase(schema.name)}${toPascalCase(table.name)}Row = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(table.name)}RowSchema>
-export type ${toPascalCase(schema.name)}${toPascalCase(table.name)}Insert = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(table.name)}InsertSchema>
-export type ${toPascalCase(schema.name)}${toPascalCase(table.name)}Update = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(table.name)}UpdateSchema>`
-
-  return [rowSchema, insertSchema, updateSchema, typeExports].join('\n\n')
-}).join('\n\n')}`
-  })
-  .filter(Boolean)
-  .join('\n\n')}
-
-// View schemas
-${schemas
-  .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-  .map((schema) => {
-    const schemaViews = [...views, ...materializedViews]
-      .filter((view) => view.schema === schema.name)
-      .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-    
-    if (schemaViews.length === 0) return ''
-    
-    return `// ${schema.name} schema views
-${schemaViews.map((view) => {
-  const viewColumns = columnsByTableId[view.id]
-  
-  // Row schema
-  const rowSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(view.name)}RowSchema = z.object({
-  ${viewColumns.map((column) => {
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    const nullable = column.is_nullable ? '.nullable()' : ''
-    return `${JSON.stringify(column.name)}: ${zodType}${nullable}`
-  }).join(',\n  ')}
-})`
-
-  // Update/Insert schemas for updatable views
-  let insertUpdateSchemas = ''
-  if ('is_updatable' in view && view.is_updatable) {
-    const insertSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(view.name)}InsertSchema = z.object({
-  ${viewColumns.map((column) => {
-    if (!column.is_updatable) {
-      return `${JSON.stringify(column.name)}: z.never().optional()`
-    }
-    
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    
-    return `${column.name}: ${zodType}.nullable().optional()`
-  }).join(',\n  ')}
-})`
-
-    const updateSchema = `export const ${toPascalCase(schema.name)}${toPascalCase(view.name)}UpdateSchema = z.object({
-  ${viewColumns.map((column) => {
-    if (!column.is_updatable) {
-      return `${JSON.stringify(column.name)}: z.never().optional()`
-    }
-    
-    const zodType = pgTypeToZodType(schema, column.format, { types, schemas, tables, views })
-    
-    return `${column.name}: ${zodType}.nullable().optional()`
-  }).join(',\n  ')}
-})`
-
-    insertUpdateSchemas = `\n\n${insertSchema}\n\n${updateSchema}`
+  const makeListShapeLine = (col: PostgresColumn, ctx: Parameters<typeof pgTypeToZodSchema>[2]) => {
+    const base = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+    const z = withNullable(base, col.is_nullable)
+    return `${JSON.stringify(col.name)}: ${z}`
   }
 
-  // Types
-  const typeExports = `export type ${toPascalCase(schema.name)}${toPascalCase(view.name)}Row = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(view.name)}RowSchema>`
-  const insertUpdateTypes = ('is_updatable' in view && view.is_updatable) 
-    ? `\nexport type ${toPascalCase(schema.name)}${toPascalCase(view.name)}Insert = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(view.name)}InsertSchema>
-export type ${toPascalCase(schema.name)}${toPascalCase(view.name)}Update = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(view.name)}UpdateSchema>`
-    : ''
+  const makeInsertShapeLine = (
+    col: PostgresColumn,
+    ctx: Parameters<typeof pgTypeToZodSchema>[2]
+  ) => {
+    // Optional when: nullable OR identity OR has default
+    const isOptional = col.is_nullable || col.is_identity || col.default_value !== null
 
-  return [rowSchema, insertUpdateSchemas, typeExports, insertUpdateTypes].filter(Boolean).join('\n\n')
-}).join('\n\n')}`
-  })
-  .filter(Boolean)
-  .join('\n\n')}
-
-// Function schemas
-${schemas
-  .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-  .map((schema) => {
-    const schemaFunctions = functions
-      .filter((func) => {
-        if (func.schema !== schema.name) {
-          return false
-        }
-
-        // Either:
-        // 1. All input args are be named, or
-        // 2. There is only one input arg which is unnamed
-        const inArgs = func.args.filter(({ mode }) => ['in', 'inout', 'variadic'].includes(mode))
-
-        if (!inArgs.some(({ name }) => name === '')) {
-          return true
-        }
-
-        if (inArgs.length === 1) {
-          return true
-        }
-
-        return false
-      })
-      .sort(({ name: a }, { name: b }) => a.localeCompare(b))
-    
-    if (schemaFunctions.length === 0) return ''
-    
-    const schemaFunctionsGroupedByName = schemaFunctions.reduce(
-      (acc, curr) => {
-        acc[curr.name] ??= []
-        acc[curr.name].push(curr)
-        return acc
-      },
-      {} as Record<string, PostgresFunction[]>
-    )
-
-    return `// ${schema.name} schema functions
-${Object.entries(schemaFunctionsGroupedByName).map(([fnName, fns]) => {
-  // Args schema
-  const argsSchemas = fns.map((fn) => {
-    const inArgs = fn.args
-      .toSorted((a, b) => a.name.localeCompare(b.name))
-      .filter(({ mode }) => mode === 'in')
-
-    if (inArgs.length === 0) {
-      return 'z.object({})'
+    // Identity ALWAYS -> forbid value if provided
+    if (col.identity_generation === 'ALWAYS') {
+      return `${JSON.stringify(col.name)}?: z.never()`
     }
 
-    const argsNameAndType = inArgs.map(({ name, type_id, has_default }) => {
-      const type = types.find(({ id }) => id === type_id)
-      let zodType = 'z.unknown()'
-      if (type) {
-        zodType = pgTypeToZodType(schema, type.name, { types, schemas, tables, views })
-      }
-      const optional = has_default ? '.optional()' : ''
-      return `${JSON.stringify(name)}: ${zodType}${optional}`
+    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+    z = withNullable(z, col.is_nullable)
+    if (isOptional) z += '.optional()'
+
+    return `${JSON.stringify(col.name)}: ${z}`
+  }
+
+  const makeUpdateShapeLine = (
+    col: PostgresColumn,
+    ctx: Parameters<typeof pgTypeToZodSchema>[2]
+  ) => {
+    // Update: everything optional; identity ALWAYS -> forbid value if provided
+    if (col.identity_generation === 'ALWAYS') {
+      return `${JSON.stringify(col.name)}?: z.never()`
+    }
+    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx)
+    z = withNullable(z, col.is_nullable)
+    z += '.optional()'
+    return `${JSON.stringify(col.name)}: ${z}`
+  }
+
+  // Build the file as a string
+  let out = `
+// Auto-generated Zod schemas for Supabase table types
+import { z } from "zod";
+
+export const supabaseZodSchemas = {
+  ${defaultSchemaTables
+    .map((table) => {
+      const ctx = { types, schemas, tables, views }
+      const cols = columnsByTableId[table.id] ?? []
+
+      const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
+      const insertShape = cols.map((c) => makeInsertShapeLine(c, ctx)).join(',\n      ')
+      const updateShape = cols.map((c) => makeUpdateShapeLine(c, ctx)).join(',\n      ')
+
+      return `${JSON.stringify(table.name)}: {
+    list: z.object({
+      ${listShape}
+    }),
+    insert: z.object({
+      ${insertShape}
+    }),
+    update: z.object({
+      ${updateShape}
+    }),
+  }`
     })
-    
-    return `z.object({ ${argsNameAndType.join(', ')} })`
-  })
-
-  const argsSchema = argsSchemas.length === 1 
-    ? argsSchemas[0] 
-    : `z.union([${argsSchemas.join(', ')}])`
-
-  // Returns schema
-  let returnsSchema = 'z.unknown()'
-  
-  // Case 1: `returns table`.
-  const tableArgs = fns[0].args.filter(({ mode }) => mode === 'table')
-  if (tableArgs.length > 0) {
-    const argsNameAndType = tableArgs.map(({ name, type_id }) => {
-      const type = types.find(({ id }) => id === type_id)
-      let zodType = 'z.unknown()'
-      if (type) {
-        zodType = pgTypeToZodType(schema, type.name, { types, schemas, tables, views })
-      }
-      return `${JSON.stringify(name)}: ${zodType}`
-    })
-
-    returnsSchema = `z.object({ ${argsNameAndType.toSorted((a, b) => a.split(':')[0].localeCompare(b.split(':')[0])).join(', ')} })`
-  } else {
-    // Case 2: returns a relation's row type.
-    const relation = [...tables, ...views].find(
-      ({ id }) => id === fns[0].return_type_relation_id
-    )
-    if (relation) {
-      returnsSchema = `${toPascalCase(schema.name)}${toPascalCase(relation.name)}RowSchema`
-    } else {
-      // Case 3: returns base/array/composite/enum type.
-      const type = types.find(({ id }) => id === fns[0].return_type_id)
-      if (type) {
-        returnsSchema = pgTypeToZodType(schema, type.name, { types, schemas, tables, views })
-      }
-    }
-  }
-
-  if (fns[0].is_set_returning_function) {
-    returnsSchema = `z.array(${returnsSchema})`
-  }
-
-  return `export const ${toPascalCase(schema.name)}${toPascalCase(fnName)}ArgsSchema = ${argsSchema}
-export const ${toPascalCase(schema.name)}${toPascalCase(fnName)}ReturnsSchema = ${returnsSchema}
-export type ${toPascalCase(schema.name)}${toPascalCase(fnName)}Args = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(fnName)}ArgsSchema>
-export type ${toPascalCase(schema.name)}${toPascalCase(fnName)}Returns = z.infer<typeof ${toPascalCase(schema.name)}${toPascalCase(fnName)}ReturnsSchema>`
-}).join('\n\n')}`
-  })
-  .filter(Boolean)
-  .join('\n\n')}
-
-// Helper functions for validation
-export const validateTableInsert = <T extends Record<string, any>>(
-  schema: z.ZodSchema<T>,
-  data: unknown
-): { success: true; data: T } | { success: false; error: z.ZodError } => {
-  const result = schema.safeParse(data)
-  return result.success
-    ? { success: true, data: result.data }
-    : { success: false, error: result.error }
-}
-
-export const validateTableUpdate = <T extends Record<string, any>>(
-  schema: z.ZodSchema<T>,
-  data: unknown
-): { success: true; data: T } | { success: false; error: z.ZodError } => {
-  const result = schema.safeParse(data)
-  return result.success
-    ? { success: true, data: result.data }
-    : { success: false, error: result.error }
-}
-
-export const validateFunctionArgs = <T extends Record<string, any>>(
-  schema: z.ZodSchema<T>,
-  args: unknown
-): { success: true; data: T } | { success: false; error: z.ZodError } => {
-  const result = schema.safeParse(args)
-  return result.success
-    ? { success: true, data: result.data }
-    : { success: false, error: result.error }
-}
+    .join(',\n  ')}
+} as const
 `
 
-  output = await prettier.format(output, {
-    parser: 'typescript',
-    semi: false,
-  })
-  return output
+  // Format nicely
+  out = await prettier.format(out, { parser: 'typescript', semi: false })
+  return out
 }
 
-// Helper function to convert snake_case to PascalCase
-const toPascalCase = (str: string): string => {
-  return str
-    .split('_')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-    .join('')
-}
-
-// TODO: Make this more robust. Currently doesn't handle range types - returns them as unknown.
-const pgTypeToZodType = (
+const pgTypeToZodSchema = (
   schema: PostgresSchema,
   pgType: string,
   {
     types,
     schemas,
-    tables,
-    views,
+    tables, // kept for signature compatibility
+    views, // kept for signature compatibility
   }: {
     types: PostgresType[]
     schemas: PostgresSchema[]
@@ -398,82 +135,59 @@ const pgTypeToZodType = (
     views: PostgresView[]
   }
 ): string => {
-  if (pgType === 'bool') {
-    return 'z.boolean()'
-  } else if (['int2', 'int4', 'int8', 'float4', 'float8', 'numeric'].includes(pgType)) {
-    return 'z.number()'
-  } else if (
-    [
-      'bytea',
-      'bpchar',
-      'varchar',
-      'date',
-      'text',
-      'citext',
-      'time',
-      'timetz',
-      'timestamp',
-      'timestamptz',
-      'uuid',
-      'vector',
-    ].includes(pgType)
-  ) {
-    return 'z.string()'
-  } else if (['json', 'jsonb'].includes(pgType)) {
-    return 'JsonSchema'
-  } else if (pgType === 'void') {
-    return 'z.undefined()'
-  } else if (pgType === 'record') {
-    return 'z.record(z.unknown())'
-  } else if (pgType.startsWith('_')) {
-    return `z.array(${pgTypeToZodType(schema, pgType.substring(1), {
+  const numberTypes = new Set(['int2', 'int4', 'int8', 'float4', 'float8', 'numeric'])
+  const stringTypes = new Set([
+    'bytea',
+    'bpchar',
+    'varchar',
+    'date',
+    'text',
+    'citext',
+    'time',
+    'timetz',
+    'timestamp',
+    'timestamptz',
+    'uuid',
+    'vector',
+  ])
+
+  const getEnumVariants = (t: string): string[] | null => {
+    const enumTypes = types.filter((type) => type.name === t && type.enums.length > 0)
+    if (enumTypes.length === 0) return null
+    const preferred = enumTypes.find((t_) => t_.schema === schema.name) || enumTypes[0]
+    // Inline variants regardless of whether the enum's schema is in `schemas`
+    return preferred.enums.map((v) => JSON.stringify(v))
+  }
+
+  // Arrays: leading underscore means array of the inner type
+  if (pgType.startsWith('_')) {
+    return `z.array(${pgTypeToZodSchema(schema, pgType.slice(1), {
       types,
       schemas,
       tables,
       views,
     })})`
-  } else {
-    const enumTypes = types.filter((type) => type.name === pgType && type.enums.length > 0)
-    if (enumTypes.length > 0) {
-      const enumType = enumTypes.find((type) => type.schema === schema.name) || enumTypes[0]
-      if (schemas.some(({ name }) => name === enumType.schema)) {
-        return `${toPascalCase(enumType.schema)}${toPascalCase(enumType.name)}Schema`
-      }
-      return `z.enum([${enumType.enums.map((variant) => JSON.stringify(variant)).join(', ')}])`
-    }
-
-    const compositeTypes = types.filter(
-      (type) => type.name === pgType && type.attributes.length > 0
-    )
-    if (compositeTypes.length > 0) {
-      const compositeType =
-        compositeTypes.find((type) => type.schema === schema.name) || compositeTypes[0]
-      if (schemas.some(({ name }) => name === compositeType.schema)) {
-        return `${toPascalCase(compositeType.schema)}${toPascalCase(compositeType.name)}Schema`
-      }
-      return 'z.unknown()'
-    }
-
-    const tableRowTypes = tables.filter((table) => table.name === pgType)
-    if (tableRowTypes.length > 0) {
-      const tableRowType =
-        tableRowTypes.find((type) => type.schema === schema.name) || tableRowTypes[0]
-      if (schemas.some(({ name }) => name === tableRowType.schema)) {
-        return `${toPascalCase(tableRowType.schema)}${toPascalCase(tableRowType.name)}RowSchema`
-      }
-      return 'z.unknown()'
-    }
-
-    const viewRowTypes = views.filter((view) => view.name === pgType)
-    if (viewRowTypes.length > 0) {
-      const viewRowType =
-        viewRowTypes.find((type) => type.schema === schema.name) || viewRowTypes[0]
-      if (schemas.some(({ name }) => name === viewRowType.schema)) {
-        return `${toPascalCase(viewRowType.schema)}${toPascalCase(viewRowType.name)}RowSchema`
-      }
-      return 'z.unknown()'
-    }
-
-    return 'z.unknown()'
   }
+
+  // Enums inline
+  {
+    const enumVariants = getEnumVariants(pgType)
+    if (enumVariants) return `z.enum([${enumVariants.join(', ')}])`
+  }
+
+  // Scalars
+  if (pgType === 'bool') return 'z.boolean()'
+  if (numberTypes.has(pgType)) return 'z.number()'
+  if (stringTypes.has(pgType)) return 'z.string()'
+  if (pgType === 'json' || pgType === 'jsonb') return 'z.any()'
+  if (pgType === 'void') return 'z.undefined()'
+  if (pgType === 'record') return 'z.record(z.unknown())'
+
+  // Everything else:
+  // - composite types
+  // - table row types
+  // - view row types
+  // - ranges (still TBD)
+  // - unknowns
+  return 'z.unknown()'
 }
