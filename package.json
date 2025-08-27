@@ -35,6 +35,7 @@
     "test:run": "PG_META_MAX_RESULT_SIZE_MB=20 PG_QUERY_TIMEOUT_SECS=5 PG_CONN_TIMEOUT_SECS=30 vitest run --coverage",
     "test:update": "run-s db:clean db:run && PG_META_MAX_RESULT_SIZE_MB=20 PG_QUERY_TIMEOUT_SECS=5 PG_CONN_TIMEOUT_SECS=30 vitest run --update && run-s db:clean"
   },
+  
   "engines": {
     "node": ">=20",
     "npm": ">=9"
