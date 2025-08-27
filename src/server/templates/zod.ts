@@ -185,7 +185,8 @@ const pgTypeToZodSchema = (
       return 'z.coerce.date()'
     } else {
       // Write shapes: only Date in, string out (ISO)
-      return 'z.instanceof(Date).transform(d => d.toISOString())'
+      // return 'z.instanceof(Date).transform(d => d.toISOString())'
+      return 'z.string()'
     }
   }
 
