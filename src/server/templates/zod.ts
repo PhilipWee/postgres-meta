@@ -130,11 +130,12 @@ const pgTypeToZodSchema = (
     types,
     schemas,
     tables, // kept for signature compatibility
-    views,  // kept for signature compatibility
+    views, // kept for signature compatibility
   }: PgTypeCtx,
   mode: ZodGenMode // <-- new
 ): string => {
-  const numberTypes = new Set(['int2', 'int4', 'int8', 'float4', 'float8', 'numeric'])
+  const integerTypes = new Set(['int2', 'int4', 'int8'])
+  const floatTypes = new Set(['float4', 'float8', 'numeric'])
 
   // Treat time-only as strings; date/timestamp handled below
   const stringTypes = new Set([
@@ -160,12 +161,17 @@ const pgTypeToZodSchema = (
 
   // Arrays: leading underscore means array of the inner type
   if (pgType.startsWith('_')) {
-    return `z.array(${pgTypeToZodSchema(schema, pgType.slice(1), {
-      types,
-      schemas,
-      tables,
-      views,
-    }, mode)})`
+    return `z.array(${pgTypeToZodSchema(
+      schema,
+      pgType.slice(1),
+      {
+        types,
+        schemas,
+        tables,
+        views,
+      },
+      mode
+    )})`
   }
 
   // Enums inline
@@ -176,7 +182,12 @@ const pgTypeToZodSchema = (
 
   // Scalars
   if (pgType === 'bool') return 'z.boolean()'
-  if (numberTypes.has(pgType)) return 'z.number()'
+
+  // Integer types
+  if (integerTypes.has(pgType)) return 'z.int()'
+
+  // Float/decimal types
+  if (floatTypes.has(pgType)) return 'z.number()'
 
   // Date-like handling differs by mode:
   if (dateLikeTypes.has(pgType)) {
@@ -191,7 +202,7 @@ const pgTypeToZodSchema = (
   }
 
   // UUID with format validation
-  if (pgType === 'uuid') return 'z.string().uuid()' // (avoid z.uuid(); ensure zod compatibility)
+  if (pgType === 'uuid') return 'z.uuid()'
 
   if (stringTypes.has(pgType)) return 'z.string()'
   if (pgType === 'json' || pgType === 'jsonb') return 'z.any()'
