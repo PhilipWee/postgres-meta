@@ -98,13 +98,13 @@ export const supabaseZodSchemas = {
       return `${JSON.stringify(table.name)}: {
     list: z.object({
       ${listShape}
-    }),
+    }).loose(),
     insert: z.object({
       ${insertShape}
-    }),
+    }).loose(),
     update: z.object({
       ${updateShape}
-    }),
+    }).loose(),
   }`
     })
     .join(',\n  ')}
