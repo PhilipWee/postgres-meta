@@ -13,17 +13,74 @@ import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 
 type ZodGenMode = 'list' | 'insert' | 'update'
 
-export const apply = async ({
-  schemas,
-  tables,
-  foreignTables,
-  views,
-  materializedViews,
-  columns,
-  types,
-  relationships,
-}: GeneratorMetadata): Promise<string> => {
-  // return `/* START GENERATED TYPES */\n` + JSON.stringify(relationships, undefined, 2)
+const defaultSchemaName = GENERATE_TYPES_DEFAULT_SCHEMA as string
+
+function getManyToManyRelations(meta: GeneratorMetadata) {
+  const { tables, relationships } = meta
+  const manyToManyRelations: Array<{
+    joinTable: string
+    leftTable: string
+    rightTable: string
+    leftKey: string
+    rightKey: string
+  }> = []
+
+  // Filter tables to only include those in the default schema
+  const defaultSchemaTables = tables.filter((table) => table.schema === defaultSchemaName)
+
+  // Find junction tables (tables that have exactly 2 foreign keys)
+  for (const table of defaultSchemaTables) {
+    const foreignKeys = relationships.filter((rel) => rel.relation === table.name)
+
+    if (foreignKeys.length === 2) {
+      const [leftRel, rightRel] = foreignKeys
+      manyToManyRelations.push({
+        joinTable: table.name,
+        leftTable: leftRel.referenced_relation,
+        rightTable: rightRel.referenced_relation,
+        leftKey: leftRel.columns[0],
+        rightKey: rightRel.columns[0],
+      })
+    }
+  }
+
+  // Create a map of table names to their many-to-many relations
+  const tableToManyToMany: Record<string, string[]> = {}
+
+  for (const relation of manyToManyRelations) {
+    // Add the right table to the left table's many-to-many list
+    if (!tableToManyToMany[relation.leftTable]) {
+      tableToManyToMany[relation.leftTable] = []
+    }
+    if (!tableToManyToMany[relation.leftTable].includes(relation.rightTable)) {
+      tableToManyToMany[relation.leftTable].push(relation.rightTable)
+    }
+
+    // Add the left table to the right table's many-to-many list
+    if (!tableToManyToMany[relation.rightTable]) {
+      tableToManyToMany[relation.rightTable] = []
+    }
+    if (!tableToManyToMany[relation.rightTable].includes(relation.leftTable)) {
+      tableToManyToMany[relation.rightTable].push(relation.leftTable)
+    }
+  }
+
+  return { manyToManyRelations, tableToManyToMany }
+}
+
+export const apply = async (meta: GeneratorMetadata): Promise<string> => {
+  const {
+    schemas,
+    tables,
+    foreignTables,
+    views,
+    materializedViews,
+    columns,
+    types,
+    relationships,
+  } = meta
+  const { tableToManyToMany } = getManyToManyRelations(meta)
+  // return `/* START GENERATED TYPES */\n` + JSON.stringify(manyToManyRelations, undefined, 2)
   // Index columns by relation id
   const columnsByTableId = Object.fromEntries<PostgresColumn[]>(
     [...tables, ...foreignTables, ...views, ...materializedViews].map((t) => [t.id, []])
@@ -34,7 +91,6 @@ export const apply = async ({
     .forEach((c) => columnsByTableId[c.table_id].push(c))
 
   // Only emit for the default schema (matches your example)
-  const defaultSchemaName = GENERATE_TYPES_DEFAULT_SCHEMA as string
   const defaultSchema =
     schemas.find((s) => s.name === defaultSchemaName) ??
     schemas[0] ??
@@ -117,13 +173,30 @@ export const supabaseZodSchemas = {
         .map((rel) => makeRelationshipShapeLine(rel, ctx))
         .join(',\n      ')
 
+      // Get many-to-many relationships for this table
+      const manyToManyRels = tableToManyToMany[table.name] || []
+      const manyToManyShape = manyToManyRels
+        .filter((relatedTable) => {
+          // Don't add if there's already a relevant relationship with the same table
+          return !relevantRels.some((rel) => rel.referenced_relation === relatedTable)
+        })
+        .map((relatedTable) => {
+          const typeVal = `supabaseZodSchemas.${relatedTable}.list`
+          return `get ${relatedTable}() { return z.array(${typeVal}).optional() }`
+        })
+        .join(',\n      ')
+
       const insertShape = cols.map((c) => makeInsertShapeLine(c, ctx)).join(',\n      ')
       const updateShape = cols.map((c) => makeUpdateShapeLine(c, ctx)).join(',\n      ')
 
+      // Combine relationship shapes
+      const finalListShape = [listShape, relationshipShape, manyToManyShape]
+        .filter((shape) => shape.length > 0)
+        .join(',\n      ')
+
       return `${JSON.stringify(table.name)}: {
     list: z.object({
-      ${listShape},
-      ${relationshipShape}
+      ${finalListShape}
     }),
     insert: z.object({
       ${insertShape}
