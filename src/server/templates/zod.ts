@@ -2,6 +2,7 @@ import prettier from 'prettier'
 import type {
   PostgresColumn,
   PostgresFunction,
+  PostgresRelationship,
   PostgresSchema,
   PostgresTable,
   PostgresType,
@@ -20,7 +21,9 @@ export const apply = async ({
   materializedViews,
   columns,
   types,
+  relationships,
 }: GeneratorMetadata): Promise<string> => {
+  // return `/* START GENERATED TYPES */\n` + JSON.stringify(relationships, undefined, 2)
   // Index columns by relation id
   const columnsByTableId = Object.fromEntries<PostgresColumn[]>(
     [...tables, ...foreignTables, ...views, ...materializedViews].map((t) => [t.id, []])
@@ -69,6 +72,11 @@ export const apply = async ({
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
+  const makeRelationshipShapeLine = (relation: PostgresRelationship, ctx: PgTypeCtx) => {
+    const typeVal = `supabaseZodSchemas.${relation.referenced_relation}.list`
+    return `get ${relation.referenced_relation}() { return ${typeVal}.optional() }`
+  }
+
   const makeUpdateShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
     // Update: everything optional; identity ALWAYS -> forbid value if provided
     if (col.identity_generation === 'ALWAYS') {
@@ -90,14 +98,32 @@ export const supabaseZodSchemas = {
     .map((table) => {
       const ctx: PgTypeCtx = { types, schemas, tables, views }
       const cols = columnsByTableId[table.id] ?? []
+      const relevantRels = relationships
+        .filter(
+          (relationship) =>
+            relationship.schema === table.schema &&
+            relationship.referenced_schema === table.schema &&
+            relationship.relation === table.name
+        )
+        .sort(
+          (a, b) =>
+            a.foreign_key_name.localeCompare(b.foreign_key_name) ||
+            a.referenced_relation.localeCompare(b.referenced_relation) ||
+            JSON.stringify(a.referenced_columns).localeCompare(JSON.stringify(b.referenced_columns))
+        )
 
       const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
+      const relationshipShape = relevantRels
+        .map((rel) => makeRelationshipShapeLine(rel, ctx))
+        .join(',\n      ')
+
       const insertShape = cols.map((c) => makeInsertShapeLine(c, ctx)).join(',\n      ')
       const updateShape = cols.map((c) => makeUpdateShapeLine(c, ctx)).join(',\n      ')
 
       return `${JSON.stringify(table.name)}: {
     list: z.object({
-      ${listShape}
+      ${listShape},
+      ${relationshipShape}
     }),
     insert: z.object({
       ${insertShape}
@@ -114,6 +140,10 @@ export const supabaseZodSchemas = {
   // Format nicely
   out = await prettier.format(out, { parser: 'typescript', semi: false })
   return out
+}
+
+const wrapAsArray = (zodSchema: string): string => {
+  return `z.array(${zodSchema})`
 }
 
 type PgTypeCtx = {
@@ -161,17 +191,19 @@ const pgTypeToZodSchema = (
 
   // Arrays: leading underscore means array of the inner type
   if (pgType.startsWith('_')) {
-    return `z.array(${pgTypeToZodSchema(
-      schema,
-      pgType.slice(1),
-      {
-        types,
-        schemas,
-        tables,
-        views,
-      },
-      mode
-    )})`
+    return wrapAsArray(
+      pgTypeToZodSchema(
+        schema,
+        pgType.slice(1),
+        {
+          types,
+          schemas,
+          tables,
+          views,
+        },
+        mode
+      )
+    )
   }
 
   // Enums inline
