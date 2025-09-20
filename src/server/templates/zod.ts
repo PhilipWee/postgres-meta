@@ -15,6 +15,18 @@ type ZodGenMode = 'list' | 'insert' | 'update'
 
 const defaultSchemaName = GENERATE_TYPES_DEFAULT_SCHEMA as string
 
+// Helper functions
+const withNullable = (inner: string, isNullable: boolean) =>
+  isNullable ? `${inner}.nullable()` : inner
+
+const withArray = (inner: string): string => {
+  return `z.array(${inner})`
+}
+
+const withOptional = (inner: string): string => {
+  return `${inner}.optional()`
+}
+
 function getManyToManyRelations(meta: GeneratorMetadata) {
   const { tables, relationships } = meta
   const manyToManyRelations: Array<{
@@ -79,8 +91,9 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     types,
     relationships,
   } = meta
+  const logs: string[] = []
+  const log = (info: string) => logs.push(info)
   const { tableToManyToMany } = getManyToManyRelations(meta)
-  // return `/* START GENERATED TYPES */\n` + JSON.stringify(manyToManyRelations, undefined, 2)
   // Index columns by relation id
   const columnsByTableId = Object.fromEntries<PostgresColumn[]>(
     [...tables, ...foreignTables, ...views, ...materializedViews].map((t) => [t.id, []])
@@ -102,9 +115,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     .filter((t) => t.schema === defaultSchema.name)
     .sort(({ name: a }, { name: b }) => a.localeCompare(b))
 
-  // Helpers to wrap nullable / optional
-  const withNullable = (inner: string, isNullable: boolean) =>
-    isNullable ? `${inner}.nullable()` : inner
+  // Helpers are now defined at the top of the file
 
   const makeListShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
     const base = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'list')
@@ -123,13 +134,15 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
 
     let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'insert')
     z = withNullable(z, col.is_nullable)
-    if (isOptional) z += '.optional()'
+    if (isOptional) z = withOptional(z)
 
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
   const makeRelationshipShapeLine = (relation: PostgresRelationship, ctx: PgTypeCtx) => {
-    const typeVal = `supabaseZodSchemas.${relation.referenced_relation}.list`
+    let typeVal = `supabaseZodSchemas.${relation.referenced_relation}.list`
+    typeVal = withNullable(typeVal, true)
+
     return `get ${relation.referenced_relation}() { return ${typeVal}.optional() }`
   }
 
@@ -140,7 +153,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     }
     let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'update')
     z = withNullable(z, col.is_nullable)
-    z += '.optional()'
+    z = withOptional(z)
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
@@ -182,7 +195,7 @@ export const supabaseZodSchemas = {
         })
         .map((relatedTable) => {
           const typeVal = `supabaseZodSchemas.${relatedTable}.list`
-          return `get ${relatedTable}() { return z.array(${typeVal}).optional() }`
+          return `get ${relatedTable}() { return ${withOptional(withArray(typeVal))} }`
         })
         .join(',\n      ')
 
@@ -208,15 +221,16 @@ export const supabaseZodSchemas = {
     })
     .join(',\n  ')}
 } as const
+
+/**
+ * Generation Logs
+ * ${logs.join('\n')}
+ */
 `
 
   // Format nicely
   out = await prettier.format(out, { parser: 'typescript', semi: false })
   return out
-}
-
-const wrapAsArray = (zodSchema: string): string => {
-  return `z.array(${zodSchema})`
 }
 
 type PgTypeCtx = {
@@ -264,7 +278,7 @@ const pgTypeToZodSchema = (
 
   // Arrays: leading underscore means array of the inner type
   if (pgType.startsWith('_')) {
-    return wrapAsArray(
+    return withArray(
       pgTypeToZodSchema(
         schema,
         pgType.slice(1),
