@@ -480,6 +480,8 @@ const pgTypeToZodSchema = (
   if (dateLikeTypes.has(pgType)) {
     if (mode === 'list') {
       // Read shapes coerce to Date
+      return 'z.coerce.date()'
+    } else if (mode === 'insert_lenient') {
       return 'dateParser'
     } else {
       // Write shapes: only Date in, string out (ISO)
