@@ -11,7 +11,125 @@ import type {
 import type { GeneratorMetadata } from '../../lib/generators.js'
 import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 
-type ZodGenMode = 'list' | 'insert' | 'update'
+type RelationMeta =
+  | {
+      type: 'to-one'
+      targetTable: string
+      targetField: string
+    }
+  | {
+      type: 'to-many'
+      joinTable: string
+      joinTargetKey: string
+      joinSourceKey: string
+      targetTable: string
+    }
+
+const zodHelperScript = `import { z } from 'zod'
+
+const boolParser = z.union([z.boolean(), z.string()]).transform((val, ctx) => {
+  if (typeof val === 'boolean') return val
+
+  if (typeof val === 'string') {
+    const lowerVal = val.toLowerCase()
+    if (lowerVal === 'false') return false
+    if (lowerVal === 'true') return true
+  }
+
+  ctx.addIssue({
+    code: 'custom',
+    message: \`Cannot coerce value to boolean. Received: \${JSON.stringify(
+      val
+    )} (type: \${typeof val})\`,
+  })
+
+  return z.NEVER
+})
+
+const intParser = z.union([z.number(), z.string()]).transform((val, ctx) => {
+  if (typeof val === 'number') {
+    if (!Number.isInteger(val)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: \`Expected integer, received float: \${val}\`,
+      })
+      return z.NEVER
+    }
+    return val
+  }
+
+  if (typeof val === 'string') {
+    const parsed = parseInt(val, 10)
+    if (isNaN(parsed) || parsed.toString() !== val) {
+      ctx.addIssue({
+        code: 'custom',
+        message: \`Cannot coerce string to integer. Received: \${JSON.stringify(val)}\`,
+      })
+      return z.NEVER
+    }
+    return parsed
+  }
+
+  ctx.addIssue({
+    code: 'custom',
+    message: \`Cannot coerce value to integer. Received: \${JSON.stringify(
+      val
+    )} (type: \${typeof val})\`,
+  })
+
+  return z.NEVER
+})
+
+const numberParser = z.union([z.number(), z.string()]).transform((val, ctx) => {
+  if (typeof val === 'number') return val
+
+  if (typeof val === 'string') {
+    const parsed = parseFloat(val)
+    if (isNaN(parsed)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: \`Cannot coerce string to number. Received: \${JSON.stringify(val)}\`,
+      })
+      return z.NEVER
+    }
+    return parsed
+  }
+
+  ctx.addIssue({
+    code: 'custom',
+    message: \`Cannot coerce value to number. Received: \${JSON.stringify(
+      val
+    )} (type: \${typeof val})\`,
+  })
+
+  return z.NEVER
+})
+
+const dateParser = z.union([z.date(), z.string()]).transform((val, ctx) => {
+  if (val instanceof Date) return val
+
+  if (typeof val === 'string') {
+    const parsed = new Date(val)
+    if (isNaN(parsed.getTime())) {
+      ctx.addIssue({
+        code: 'custom',
+        message: \`Cannot coerce string to date. Received: \${JSON.stringify(val)}\`,
+      })
+      return z.NEVER
+    }
+    return parsed
+  }
+
+  ctx.addIssue({
+    code: 'custom',
+    message: \`Cannot coerce value to date. Received: \${JSON.stringify(val)} (type: \${typeof val})\`,
+  })
+
+  return z.NEVER
+})
+`
+
+type ZodGenMode = 'list' | 'insert' | 'update' | 'insert_lenient'
 
 const defaultSchemaName = GENERATE_TYPES_DEFAULT_SCHEMA as string
 
@@ -27,15 +145,31 @@ const withOptional = (inner: string): string => {
   return `${inner}.optional()`
 }
 
+function withRelationMeta(inner: string, meta: RelationMeta) {
+  return `${inner}.meta(${JSON.stringify(meta)})`
+}
+
+type ManyToManyMeta = {
+  joinTable: string
+  leftTable: string
+  rightTable: string
+  leftKey: string
+  rightKey: string
+}
+
+function reverseLeftRightForManyToMany(meta: ManyToManyMeta): ManyToManyMeta {
+  return {
+    joinTable: meta.joinTable,
+    leftTable: meta.rightTable,
+    rightTable: meta.leftTable,
+    leftKey: meta.rightKey,
+    rightKey: meta.leftKey,
+  }
+}
+
 function getManyToManyRelations(meta: GeneratorMetadata) {
   const { tables, relationships } = meta
-  const manyToManyRelations: Array<{
-    joinTable: string
-    leftTable: string
-    rightTable: string
-    leftKey: string
-    rightKey: string
-  }> = []
+  const manyToManyRelations: Array<ManyToManyMeta> = []
 
   // Filter tables to only include those in the default schema
   const defaultSchemaTables = tables.filter((table) => table.schema === defaultSchemaName)
@@ -57,23 +191,24 @@ function getManyToManyRelations(meta: GeneratorMetadata) {
   }
 
   // Create a map of table names to their many-to-many relations
-  const tableToManyToMany: Record<string, string[]> = {}
+  const tableToManyToMany: Record<string, ManyToManyMeta[]> = {}
 
   for (const relation of manyToManyRelations) {
     // Add the right table to the left table's many-to-many list
-    if (!tableToManyToMany[relation.leftTable]) {
-      tableToManyToMany[relation.leftTable] = []
-    }
-    if (!tableToManyToMany[relation.leftTable].includes(relation.rightTable)) {
-      tableToManyToMany[relation.leftTable].push(relation.rightTable)
+    tableToManyToMany[relation.leftTable] ??= []
+    if (!tableToManyToMany[relation.leftTable].some((r) => r.rightTable === relation.rightTable)) {
+      tableToManyToMany[relation.leftTable].push(relation)
     }
 
-    // Add the left table to the right table's many-to-many list
-    if (!tableToManyToMany[relation.rightTable]) {
-      tableToManyToMany[relation.rightTable] = []
-    }
-    if (!tableToManyToMany[relation.rightTable].includes(relation.leftTable)) {
-      tableToManyToMany[relation.rightTable].push(relation.leftTable)
+    // Add the left table to the right table's many-to-many list (reversed)
+    const reversedRelation = reverseLeftRightForManyToMany(relation)
+    tableToManyToMany[relation.rightTable] ??= []
+    if (
+      !tableToManyToMany[relation.rightTable].some(
+        (r) => r.rightTable === reversedRelation.rightTable
+      )
+    ) {
+      tableToManyToMany[relation.rightTable].push(reversedRelation)
     }
   }
 
@@ -123,7 +258,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
-  const makeInsertShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
+  const makeInsertShapeLine = (col: PostgresColumn, ctx: PgTypeCtx, lenient: boolean) => {
     // Optional when: nullable OR identity OR has default
     const isOptional = col.is_nullable || col.is_identity || col.default_value !== null
 
@@ -132,7 +267,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
       return `${JSON.stringify(col.name)}?: z.never()`
     }
 
-    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, 'insert')
+    let z = pgTypeToZodSchema(defaultSchema, col.format, ctx, lenient ? 'insert_lenient' : 'insert')
     z = withNullable(z, col.is_nullable)
     if (isOptional) z = withOptional(z)
 
@@ -141,6 +276,11 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
 
   const makeRelationshipShapeLine = (relation: PostgresRelationship, ctx: PgTypeCtx) => {
     let typeVal = `supabaseZodSchemas.${relation.referenced_relation}.list`
+    typeVal = withRelationMeta(typeVal, {
+      type: 'to-one',
+      targetTable: relation.referenced_relation,
+      targetField: relation.referenced_columns[0],
+    })
     typeVal = withNullable(typeVal, true)
 
     return `get ${relation.referenced_relation}() { return ${typeVal}.optional() }`
@@ -160,7 +300,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
   // Build the file as a string
   let out = `
 /* START GENERATED TYPES */
-import { z } from "zod";
+${zodHelperScript}
 
 export const supabaseZodSchemas = {
   ${defaultSchemaTables
@@ -191,15 +331,25 @@ export const supabaseZodSchemas = {
       const manyToManyShape = manyToManyRels
         .filter((relatedTable) => {
           // Don't add if there's already a relevant relationship with the same table
-          return !relevantRels.some((rel) => rel.referenced_relation === relatedTable)
+          return !relevantRels.some((rel) => rel.referenced_relation === relatedTable.rightTable)
         })
         .map((relatedTable) => {
-          const typeVal = `supabaseZodSchemas.${relatedTable}.list`
-          return `get ${relatedTable}() { return ${withOptional(withArray(typeVal))} }`
+          let typeVal = `supabaseZodSchemas.${relatedTable.rightTable}.list`
+          typeVal = withRelationMeta(typeVal, {
+            type: 'to-many',
+            joinTable: relatedTable.joinTable,
+            joinTargetKey: relatedTable.rightKey,
+            joinSourceKey: relatedTable.leftKey,
+            targetTable: relatedTable.rightTable,
+          })
+          return `get ${relatedTable.rightTable}() { return ${withOptional(withArray(typeVal))} }`
         })
         .join(',\n      ')
 
-      const insertShape = cols.map((c) => makeInsertShapeLine(c, ctx)).join(',\n      ')
+      const insertShape = cols.map((c) => makeInsertShapeLine(c, ctx, false)).join(',\n      ')
+      const insertLenientShape = cols
+        .map((c) => makeInsertShapeLine(c, ctx, true))
+        .join(',\n      ')
       const updateShape = cols.map((c) => makeUpdateShapeLine(c, ctx)).join(',\n      ')
 
       // Combine relationship shapes
@@ -213,6 +363,9 @@ export const supabaseZodSchemas = {
     }),
     insert: z.object({
       ${insertShape}
+    }),
+    insert_lenient: z.object({
+      ${insertLenientShape}
     }),
     update: z.object({
       ${updateShape}
@@ -249,7 +402,7 @@ const pgTypeToZodSchema = (
     tables, // kept for signature compatibility
     views, // kept for signature compatibility
   }: PgTypeCtx,
-  mode: ZodGenMode // <-- new
+  mode: ZodGenMode
 ): string => {
   const integerTypes = new Set(['int2', 'int4', 'int8'])
   const floatTypes = new Set(['float4', 'float8', 'numeric'])
@@ -300,19 +453,34 @@ const pgTypeToZodSchema = (
   }
 
   // Scalars
-  if (pgType === 'bool') return 'z.boolean()'
+  if (pgType === 'bool') {
+    if (mode === 'insert_lenient') {
+      return 'boolParser'
+    }
+    return 'z.boolean()'
+  }
 
   // Integer types
-  if (integerTypes.has(pgType)) return 'z.int()'
+  if (integerTypes.has(pgType)) {
+    if (mode === 'insert_lenient') {
+      return 'intParser'
+    }
+    return 'z.int()'
+  }
 
   // Float/decimal types
-  if (floatTypes.has(pgType)) return 'z.number()'
+  if (floatTypes.has(pgType)) {
+    if (mode === 'insert_lenient') {
+      return 'numberParser'
+    }
+    return 'z.number()'
+  }
 
   // Date-like handling differs by mode:
   if (dateLikeTypes.has(pgType)) {
     if (mode === 'list') {
       // Read shapes coerce to Date
-      return 'z.coerce.date()'
+      return 'dateParser'
     } else {
       // Write shapes: only Date in, string out (ISO)
       // return 'z.instanceof(Date).transform(d => d.toISOString())'
