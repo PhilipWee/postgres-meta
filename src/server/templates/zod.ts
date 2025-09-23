@@ -14,8 +14,9 @@ import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 type RelationMeta =
   | {
       type: 'to-one'
+      sourceKey: string
+      targetKey: string
       targetTable: string
-      targetField: string
     }
   | {
       type: 'to-many'
@@ -279,7 +280,8 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     typeVal = withRelationMeta(typeVal, {
       type: 'to-one',
       targetTable: relation.referenced_relation,
-      targetField: relation.referenced_columns[0],
+      targetKey: relation.referenced_columns[0],
+      sourceKey: relation.columns[0]
     })
     typeVal = withNullable(typeVal, true)
 
