@@ -1,6 +1,6 @@
 import prettier from 'prettier/standalone.js'
 import SqlFormatter from 'prettier-plugin-sql'
-import { parse, deparse } from 'pgsql-parser'
+import { parse, deparse, deparseSync } from 'pgsql-parser'
 import { FormatterOptions } from './types.js'
 
 const DEFAULT_FORMATTER_OPTIONS = {
@@ -33,7 +33,7 @@ interface ParseReturnValues {
  */
 export function Deparse(parsedSql: object): DeparseReturnValues {
   try {
-    const data = deparse(parsedSql, {})
+    const data = deparseSync(parsedSql, {})
     return { data, error: null }
   } catch (error) {
     return { data: null, error: error as Error }
