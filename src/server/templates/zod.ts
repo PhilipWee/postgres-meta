@@ -191,6 +191,29 @@ function getManyToManyRelations(meta: GeneratorMetadata) {
     }
   }
 
+  const selfReferencingRelations = relationships
+    .filter(
+      (relationship) =>
+        //If the referenced relation is the same table, it has to be many-to-many
+        relationship.referenced_relation === relationship.relation
+    )
+    .sort(
+      (a, b) =>
+        a.foreign_key_name.localeCompare(b.foreign_key_name) ||
+        a.referenced_relation.localeCompare(b.referenced_relation) ||
+        JSON.stringify(a.referenced_columns).localeCompare(JSON.stringify(b.referenced_columns))
+    )
+
+  for (const relation of selfReferencingRelations) {
+    manyToManyRelations.push({
+      joinTable: relation.relation,
+      leftTable: relation.relation,
+      rightTable: relation.relation,
+      leftKey: relation.columns[0],
+      rightKey: relation.referenced_columns[0],
+    })
+  }
+
   // Create a map of table names to their many-to-many relations
   const tableToManyToMany: Record<string, ManyToManyMeta[]> = {}
 
@@ -314,12 +337,14 @@ export const supabaseZodSchemas = {
       const isView = defaultSchemaViews.includes(tableOrView as any)
       const ctx: PgTypeCtx = { types, schemas, tables, views }
       const cols = columnsByTableId[tableOrView.id] ?? []
-      const relevantRels = relationships
+      const relevantOneToOneRels = relationships
         .filter(
           (relationship) =>
             relationship.schema === tableOrView.schema &&
             relationship.referenced_schema === tableOrView.schema &&
-            relationship.relation === tableOrView.name
+            relationship.relation === tableOrView.name &&
+            //If the referenced relation is the same table, it has to be one-to-many
+            relationship.referenced_relation !== tableOrView.name
         )
         .sort(
           (a, b) =>
@@ -328,8 +353,12 @@ export const supabaseZodSchemas = {
             JSON.stringify(a.referenced_columns).localeCompare(JSON.stringify(b.referenced_columns))
         )
 
+      if (tableOrView.name === 'customers') {
+        log(JSON.stringify(relationships, undefined, 2))
+      }
+
       const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
-      const relationshipShape = relevantRels
+      const relationshipShape = relevantOneToOneRels
         .map((rel) => makeRelationshipShapeLine(rel, ctx))
         .join(',\n      ')
 
@@ -338,7 +367,9 @@ export const supabaseZodSchemas = {
       const manyToManyShape = manyToManyRels
         .filter((relatedTable) => {
           // Don't add if there's already a relevant relationship with the same table
-          return !relevantRels.some((rel) => rel.referenced_relation === relatedTable.rightTable)
+          return !relevantOneToOneRels.some(
+            (rel) => rel.referenced_relation === relatedTable.rightTable
+          )
         })
         .map((relatedTable) => {
           let typeVal = `supabaseZodSchemas.${relatedTable.rightTable}.list`
