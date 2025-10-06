@@ -251,6 +251,10 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     .filter((t) => t.schema === defaultSchema.name)
     .sort(({ name: a }, { name: b }) => a.localeCompare(b))
 
+  const defaultSchemaViews = [...views]
+    .filter((v) => v.schema === defaultSchema.name)
+    .sort(({ name: a }, { name: b }) => a.localeCompare(b))
+
   // Helpers are now defined at the top of the file
 
   const makeListShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
@@ -281,7 +285,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
       type: 'to-one',
       targetTable: relation.referenced_relation,
       targetKey: relation.referenced_columns[0],
-      sourceKey: relation.columns[0]
+      sourceKey: relation.columns[0],
     })
     typeVal = withNullable(typeVal, true)
 
@@ -305,16 +309,17 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
 ${zodHelperScript}
 
 export const supabaseZodSchemas = {
-  ${defaultSchemaTables
-    .map((table) => {
+  ${[...defaultSchemaTables, ...defaultSchemaViews]
+    .map((tableOrView) => {
+      const isView = defaultSchemaViews.includes(tableOrView as any)
       const ctx: PgTypeCtx = { types, schemas, tables, views }
-      const cols = columnsByTableId[table.id] ?? []
+      const cols = columnsByTableId[tableOrView.id] ?? []
       const relevantRels = relationships
         .filter(
           (relationship) =>
-            relationship.schema === table.schema &&
-            relationship.referenced_schema === table.schema &&
-            relationship.relation === table.name
+            relationship.schema === tableOrView.schema &&
+            relationship.referenced_schema === tableOrView.schema &&
+            relationship.relation === tableOrView.name
         )
         .sort(
           (a, b) =>
@@ -329,7 +334,7 @@ export const supabaseZodSchemas = {
         .join(',\n      ')
 
       // Get many-to-many relationships for this table
-      const manyToManyRels = tableToManyToMany[table.name] || []
+      const manyToManyRels = tableToManyToMany[tableOrView.name] || []
       const manyToManyShape = manyToManyRels
         .filter((relatedTable) => {
           // Don't add if there's already a relevant relationship with the same table
@@ -359,7 +364,15 @@ export const supabaseZodSchemas = {
         .filter((shape) => shape.length > 0)
         .join(',\n      ')
 
-      return `${JSON.stringify(table.name)}: {
+      if (isView) {
+        return `${JSON.stringify(tableOrView.name)}: {
+            list: z.object({
+              ${finalListShape}
+            }),
+          }`
+      }
+
+      return `${JSON.stringify(tableOrView.name)}: {
     list: z.object({
       ${finalListShape}
     }),
