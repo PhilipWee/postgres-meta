@@ -11,6 +11,15 @@ import type {
 import type { GeneratorMetadata } from '../../lib/generators.js'
 import { GENERATE_TYPES_DEFAULT_SCHEMA } from '../constants.js'
 
+const logs: string[] = []
+const log = (info: unknown) => {
+  if (typeof info === 'object' && info !== null) {
+    logs.push(JSON.stringify(info, null, 2))
+  } else {
+    logs.push(String(info))
+  }
+}
+
 type RelationMeta =
   | {
       type: 'to-one'
@@ -177,7 +186,13 @@ function getManyToManyRelations(meta: GeneratorMetadata) {
 
   // Find junction tables (tables that have exactly 2 foreign keys)
   for (const table of defaultSchemaTables) {
-    const foreignKeys = relationships.filter((rel) => rel.relation === table.name)
+    const foreignKeys = relationships.filter(
+      (rel) =>
+        rel.relation === table.name &&
+        //Only do public schema
+        rel.schema === 'public' &&
+        rel.referenced_schema === 'public'
+    )
 
     if (foreignKeys.length === 2) {
       const [leftRel, rightRel] = foreignKeys
@@ -250,8 +265,6 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     types,
     relationships,
   } = meta
-  const logs: string[] = []
-  const log = (info: string) => logs.push(info)
   const { tableToManyToMany } = getManyToManyRelations(meta)
   // Index columns by relation id
   const columnsByTableId = Object.fromEntries<PostgresColumn[]>(
@@ -344,7 +357,10 @@ export const supabaseZodSchemas = {
             relationship.referenced_schema === tableOrView.schema &&
             relationship.relation === tableOrView.name &&
             //If the referenced relation is the same table, it has to be one-to-many
-            relationship.referenced_relation !== tableOrView.name
+            relationship.referenced_relation !== tableOrView.name &&
+            //Don't do non public schemas
+            relationship.schema === 'public' &&
+            relationship.referenced_schema === 'public'
         )
         .sort(
           (a, b) =>
@@ -352,10 +368,6 @@ export const supabaseZodSchemas = {
             a.referenced_relation.localeCompare(b.referenced_relation) ||
             JSON.stringify(a.referenced_columns).localeCompare(JSON.stringify(b.referenced_columns))
         )
-
-      if (tableOrView.name === 'customers') {
-        log(JSON.stringify(relationships, undefined, 2))
-      }
 
       const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
       const relationshipShape = relevantOneToOneRels
