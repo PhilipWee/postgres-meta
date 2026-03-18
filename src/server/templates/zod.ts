@@ -315,7 +315,11 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     return `${JSON.stringify(col.name)}: ${z}`
   }
 
-  const makeRelationshipShapeLine = (relation: PostgresRelationship, ctx: PgTypeCtx) => {
+  const makeRelationshipShapeLine = (
+    relation: PostgresRelationship,
+    ctx: PgTypeCtx,
+    getterName: string
+  ) => {
     let typeVal = `supabaseZodSchemas.${relation.referenced_relation}.list`
     typeVal = withRelationMeta(typeVal, {
       type: 'to-one',
@@ -325,7 +329,7 @@ export const apply = async (meta: GeneratorMetadata): Promise<string> => {
     })
     typeVal = withNullable(typeVal, true)
 
-    return `get ${relation.referenced_relation}() { return ${typeVal}.optional() }`
+    return `get ${getterName}() { return ${typeVal}.optional() }`
   }
 
   const makeUpdateShapeLine = (col: PostgresColumn, ctx: PgTypeCtx) => {
@@ -370,8 +374,31 @@ export const supabaseZodSchemas = {
         )
 
       const listShape = cols.map((c) => makeListShapeLine(c, ctx)).join(',\n      ')
+
+      // Count how many rels target each table to detect duplicates
+      const targetTableCounts = new Map<string, number>()
+      for (const rel of relevantOneToOneRels) {
+        targetTableCounts.set(
+          rel.referenced_relation,
+          (targetTableCounts.get(rel.referenced_relation) ?? 0) + 1
+        )
+      }
+
       const relationshipShape = relevantOneToOneRels
-        .map((rel) => makeRelationshipShapeLine(rel, ctx))
+        .map((rel) => {
+          let getterName: string
+          if ((targetTableCounts.get(rel.referenced_relation) ?? 0) <= 1) {
+            // No duplicates — keep current behaviour
+            getterName = rel.referenced_relation
+          } else if (rel.columns[0].endsWith('_id')) {
+            // Duplicate, sourceKey ends with _id — strip _id, append _targetTable
+            getterName = `${rel.columns[0].slice(0, -3)}_${rel.referenced_relation}`
+          } else {
+            // Duplicate, sourceKey doesn't end with _id — sourceKey_targetTable
+            getterName = `${rel.columns[0]}_${rel.referenced_relation}`
+          }
+          return makeRelationshipShapeLine(rel, ctx, getterName)
+        })
         .join(',\n      ')
 
       // Get many-to-many relationships for this table
